@@ -1,0 +1,291 @@
+name: build-unlocked-apks
+
+# Builds "drive-unlocked" rebuilds of the AA head-unit apps.
+#
+# Root cause: Android Auto classifies apps declaring android:appCategory="game" (or "video") as
+# "parked apps" -> they are blocked while the car is moving. AABrowser ships appCategory="game",
+# so the manifest is patched to drop the parked category and stay a distractionOptimized "custom app".
+# Variants are built so the one that the AA host accepts can be picked empirically.
+# Everything is downloaded by URL, so this workflow can live in any repo.
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: aa-unlock-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  APKTOOL_JAR: https://github.com/iBotPeaches/Apktool/releases/download/v2.11.1/apktool_2.11.1.jar
+  BROWSER_REPO: kododake/AABrowser
+  HOST_REPO: kododake/AAAnything
+
+jobs:
+  keys:
+    name: keystore
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: repo
+      - name: make or reuse keystore
+        working-directory: repo
+        run: |
+          set -eux
+          mkdir -p .keystore
+          if [ ! -f .keystore/rsa.jks ]; then
+            keytool -genkeypair -v -keystore .keystore/rsa.jks -storepass android -keypass android \
+              -alias unlocked -keyalg RSA -keysize 2048 -validity 12000 \
+              -dname "CN=RoninMerc unlocked, O=AAUnlock, C=US"
+          fi
+          keytool -list -keystore .keystore/rsa.jks -storepass android
+      - name: commit keystore for stable future keys
+        continue-on-error: true
+        working-directory: repo
+        run: |
+          set -x
+          git config user.email "actions@github.com"
+          git config user.name "github-actions"
+          git add .keystore/rsa.jks
+          git diff --cached --quiet || { git commit -m "build: stable signing keystore"; git push; }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: keystore
+          path: repo/.keystore/rsa.jks
+
+  aabrowser-source:
+    name: AABrowser from source
+    needs: keys
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - name: checkout browser fork
+        uses: actions/checkout@v4
+        with:
+          repository: RoninMerc/Ronin-Mobile-Browser
+          path: src
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - uses: android-actions/setup-android@v3
+      - uses: actions/download-artifact@v4
+        with:
+          name: keystore
+          path: keys
+      - name: build variants (none / maps / productivity)
+        working-directory: src
+        run: |
+          set -eux
+          chmod +x gradlew
+          OUT="$GITHUB_WORKSPACE/out"; mkdir -p "$OUT"
+          KS="$GITHUB_WORKSPACE/keys/rsa.jks"
+          java -version
+          printf 'sdk.dir=%s\n' "${ANDROID_SDK_ROOT:-$ANDROID_HOME}" > local.properties
+          cat >> local.properties <<EOF
+          RELEASE_STORE_FILE=$KS
+          RELEASE_STORE_PASSWORD=android
+          RELEASE_KEY_ALIAS=unlocked
+          RELEASE_KEY_PASSWORD=android
+          STORE_FILE=$KS
+          STORE_PASSWORD=android
+          KEY_ALIAS=unlocked
+          KEY_PASSWORD=android
+          KEYSTORE_FILE=$KS
+          KEYSTORE_PASSWORD=android
+          EOF
+          sed -i -E 's/versionCode *= *[0-9]+/versionCode = 1002/' app/build.gradle.kts
+          sed -i -E 's/versionName *= *"[^"]*"/versionName = "3.5-drive"/' app/build.gradle.kts
+          grep -nE 'versionCode|versionName' app/build.gradle.kts || true
+          echo "--- manifest BEFORE ---"; cat app/src/main/AndroidManifest.xml
+          SIG="-PRELEASE_STORE_FILE=$KS -PRELEASE_STORE_PASSWORD=android -PRELEASE_KEY_ALIAS=unlocked -PRELEASE_KEY_PASSWORD=android"
+          for V in none maps productivity; do
+            (
+              set -e
+              M=app/src/main/AndroidManifest.xml
+              if [ "$V" = none ]; then
+                sed -i -E 's/[[:space:]]*android:appCategory="[^"]*"//' "$M"
+              elif grep -q 'android:appCategory' "$M"; then
+                sed -i -E "s/android:appCategory=\"[^\"]*\"/android:appCategory=\"$V\"/g" "$M"
+              else
+                sed -i -E "0,/<application/{s/<application/<application android:appCategory=\"$V\"/}" "$M"
+              fi
+              sed -i -E 's/(distractionOptimized" *android:value=")false/\1true/g' "$M"
+              grep -o 'appCategory="[^"]*"' "$M" || echo "appCategory: (removed)"
+              rm -rf app/build/outputs/apk
+              if ./gradlew assembleRelease --stacktrace $SIG; then
+                echo "release build ok"
+              else
+                echo "release build failed -> debug build"
+                ./gradlew assembleDebug --stacktrace || true
+              fi
+              APK=$(find app/build/outputs/apk -name '*.apk' | head -1)
+              echo "PICKED=$APK"
+              cp "$APK" "$OUT/AABrowser-3.5-drive-$V.apk"
+            ) || echo "VARIANT FAILED: $V"
+          done
+          ls -l "$OUT" || true
+      - name: zipalign + sign
+        if: ${{ !cancelled() }}
+        run: |
+          set -eux
+          BT=$(ls -d "${ANDROID_SDK_ROOT:-$ANDROID_HOME}"/build-tools/* | sort -V | tail -1)
+          KS="$GITHUB_WORKSPACE/keys/rsa.jks"
+          for f in out/*.apk; do
+            [ -f "$f" ] || continue
+            zip -d "$f" 'META-INF/*.RSA' 'META-INF/*.SF' 'META-INF/*.MF' || true
+            "$BT/zipalign" -p -f 4 "$f" "$f.aligned"
+            "$BT/apksigner" sign --ks "$KS" --ks-pass pass:android --key-pass pass:android --ks-key-alias unlocked "$f.aligned"
+            mv "$f.aligned" "$f"
+            "$BT/apksigner" verify --print-certs "$f" | tail -3 || true
+          done
+          sha256sum out/*.apk | tee out/SHA256SUMS-source.txt
+      - uses: actions/upload-artifact@v4
+        if: ${{ !cancelled() }}
+        with:
+          name: aabrowser-source
+          path: out/
+
+  apktool-patch:
+    name: apktool patch of official releases
+    needs: keys
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - uses: android-actions/setup-android@v3
+      - uses: actions/download-artifact@v4
+        with:
+          name: keystore
+          path: keys
+      - name: decode, patch, rebuild, sign
+        run: |
+          set -ux
+          export KS="$GITHUB_WORKSPACE/keys/rsa.jks"
+          export OUT="$GITHUB_WORKSPACE/out"; mkdir -p "$OUT" work
+          BT=$(ls -d "${ANDROID_SDK_ROOT:-$ANDROID_HOME}"/build-tools/* | sort -V | tail -1)
+          export PATH="$BT:$PATH"
+          curl -sSL -o work/apktool.jar "$APKTOOL_JAR"
+          ls -l work/apktool.jar
+          cat > work/patchman.py <<'PY'
+          import re, sys
+          p = sys.argv[1]
+          appcat = sys.argv[2] if len(sys.argv) > 2 else 'keep'
+          s = open(p, encoding='utf-8').read()
+          if appcat == 'none':
+              s = re.sub(r'[ \t]*android:appCategory="[^"]*"', '', s)
+          elif appcat != 'keep':
+              if 'android:appCategory' in s:
+                  s = re.sub(r'android:appCategory="[^"]*"', 'android:appCategory="%s"' % appcat, s)
+              else:
+                  s = re.sub(r'<application\b', '<application android:appCategory="%s"' % appcat, s, count=1)
+          s = re.sub(r'(android:name="distractionOptimized" +android:value=")false', r'\1true', s)
+          if 'distractionOptimized' not in s:
+              s = s.replace('</application>', '        <meta-data android:name="distractionOptimized" android:value="true"/>\n    </application>', 1)
+          if 'CAR_LAUNCHER' not in s:
+              for b in re.finditer(r'<activity\b.*?</activity>', s, re.S):
+                  if 'android.intent.category.LAUNCHER' in b.group(0):
+                      ins = '\n            <intent-filter>\n                <action android:name="android.intent.action.MAIN"/>\n                <category android:name="android.intent.category.CAR_LAUNCHER"/>\n            </intent-filter>\n'
+                      s = s[:b.end()-len('</activity>')] + ins + s[b.end()-len('</activity>'):]
+                      print('added CAR_LAUNCHER')
+                      break
+          open(p, 'w', encoding='utf-8').write(s)
+          print('patched', p, 'appcat=', repr(appcat))
+          PY
+          cat > work/bumpver.py <<'PY'
+          import re, sys
+          p, tag = sys.argv[1], sys.argv[2]
+          s = open(p, encoding='utf-8').read()
+          s = re.sub(r'(versionCode: *)["\']?\d+["\']?', r"\g<1>'1002'", s)
+          s = re.sub(r'(versionName: *).*', r'\g<1>' + tag + '-drive', s)
+          open(p, 'w', encoding='utf-8').write(s)
+          print(s)
+          PY
+          for SPEC in "AABrowser:$BROWSER_REPO:none" "AABrowser:$BROWSER_REPO:maps" "AAAnything:$HOST_REPO:keep" "AAAnything:$HOST_REPO:none"; do
+            NAME=${SPEC%%:*}; rest=${SPEC#*:}; REPO=${rest%%:*}; APP=${rest#*:}
+            D="work/dec-$NAME-$APP"
+            (
+              set -e
+              rm -rf "$D"
+              curl -sSL -H "Authorization: Bearer ${{ github.token }}" -o work/rel.json "https://api.github.com/repos/$REPO/releases/latest"
+              python3 -c "import json;d=json.load(open('work/rel.json'));print('release:',d.get('tag_name'));[print(' asset:',a['name']) for a in d.get('assets',[])]"
+              ASSET=$(python3 -c "import json;d=json.load(open('work/rel.json'));print([a['browser_download_url'] for a in d.get('assets',[]) if a['name'].lower().endswith('.apk')][0])")
+              TAG=$(python3 -c "import json;d=json.load(open('work/rel.json'));print(d.get('tag_name','0').lstrip('v'))")
+              echo "ASSET=$ASSET TAG=$TAG"
+              curl -sSL -o work/base.apk "$ASSET"
+              ls -l work/base.apk
+              java -jar work/apktool.jar d -f work/base.apk -o "$D"
+              echo "=== $NAME manifest ($APP) ==="; cat "$D/AndroidManifest.xml"
+              python3 work/patchman.py "$D/AndroidManifest.xml" "$APP"
+              grep -o 'appCategory="[^"]*"' "$D/AndroidManifest.xml" || true
+              grep -c CAR_LAUNCHER "$D/AndroidManifest.xml" || true
+              python3 work/bumpver.py "$D/apktool.yml" "$TAG"
+              java -jar work/apktool.jar b "$D" -o "work/$NAME-$APP-unsigned.apk"
+              ls -l "work/$NAME-$APP-unsigned.apk"
+              cp "work/$NAME-$APP-unsigned.apk" "$OUT/$NAME-$TAG-drive-$APP.apk"
+            ) || echo "APP FAILED: $NAME $APP"
+          done
+          ls -l "$OUT" || true
+      - name: zipalign + sign
+        if: ${{ !cancelled() }}
+        run: |
+          set -eux
+          BT=$(ls -d "${ANDROID_SDK_ROOT:-$ANDROID_HOME}"/build-tools/* | sort -V | tail -1)
+          KS="$GITHUB_WORKSPACE/keys/rsa.jks"
+          for f in out/*.apk; do
+            [ -f "$f" ] || continue
+            zip -d "$f" 'META-INF/*.RSA' 'META-INF/*.SF' 'META-INF/*.MF' || true
+            "$BT/zipalign" -p -f 4 "$f" "$f.aligned"
+            "$BT/apksigner" sign --ks "$KS" --ks-pass pass:android --key-pass pass:android --ks-key-alias unlocked "$f.aligned"
+            mv "$f.aligned" "$f"
+            "$BT/apksigner" verify --print-certs "$f" | tail -3 || true
+          done
+          sha256sum out/*.apk | tee out/SHA256SUMS-apktool.txt
+      - uses: actions/upload-artifact@v4
+        if: ${{ !cancelled() }}
+        with:
+          name: apktool-patch
+          path: out/
+
+  release:
+    name: publish release
+    needs: [aabrowser-source, apktool-patch]
+    runs-on: ubuntu-latest
+    if: ${{ !cancelled() }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: all
+          merge-multiple: true
+      - name: gh release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -ux
+          ls -lR all || true
+          TAG="unlocked-${{ github.run_number }}"
+          cat > notes.md <<'EOF'
+          Drive-unlocked rebuilds of the Android Auto head-unit apps.
+
+          Why they were blocked: Android Auto treats android:appCategory="game" (and "video") as a
+          "parked app" and blocks it while the car moves. AABrowser shipped appCategory="game".
+
+          What changed (manifest + version only, no app logic touched):
+          - appCategory removed (-none) or changed to a non-parked value (-maps / -productivity).
+          - distractionOptimized forced to true, CAR_LAUNCHER ensured.
+          - versionCode/versionName bumped; unsigned output re-signed with the keystore in this release.
+
+          Try -none first, then -maps. Install via Shizuku-Next + KingInstaller, then Android Auto
+          developer settings, Unknown sources, Customize launcher. Uninstall the upstream build first
+          (different signing key).
+          EOF
+          gh release create "$TAG" all/*.apk all/rsa.jks all/SHA256SUMS-*.txt \
+            --title "Drive-unlocked APKs $TAG" --notes-file notes.md || echo "release create failed (tag may exist)"
