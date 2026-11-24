@@ -220,37 +220,7 @@ jobs:
           open(p, 'w', encoding='utf-8').write(s)
           print(s)
           PY
-          cat > work/patchaa.py <<'PY'
-          import glob, sys
-          d, cat = sys.argv[1], int(sys.argv[2])
-          # apktool cannot relink AppCompat's app:srcCompat (attribute lives in the library package).
-          for x in glob.glob(d + '/res/**/*.xml', recursive=True):
-              s = open(x, encoding='utf-8').read()
-              if 'app:srcCompat' in s:
-                  open(x, 'w', encoding='utf-8').write(s.replace('app:srcCompat', 'android:src'))
-                  print('srcCompat -> android:src:', x)
-          # AAAnything stamps android:appCategory=0 (GAME) into every APK it patches, which is
-          # exactly what makes Android Auto treat those apps as parked. Rewrite the constant to
-          # a non-parked category (6=maps, 7=productivity).
-          hit = 0
-          for f in glob.glob(d + '/smali*/**/*.smali', recursive=True):
-              lines = open(f, encoding='utf-8').read().split('\n')
-              if not any('"appCategory"' in l for l in lines):
-                  continue
-              for i, l in enumerate(lines):
-                  if 'putInt(I)Ljava/nio/ByteBuffer;' in l and '{v0, v13}' in l:
-                      if 'const/16 v7, 0x10' in '\n'.join(lines[max(0, i-25):i]):
-                          lines[i:i+1] = ['    const/4 v13, 0x%x' % cat, l, '    const/4 v13, 0x0']
-                          hit += 1
-                          break
-              if hit:
-                  open(f, 'w', encoding='utf-8').write('\n'.join(lines))
-                  print('patched appCategory in', f, '->', cat)
-                  break
-          if not hit:
-              sys.exit('appCategory constant not found - AAAnything patcher changed')
-          PY
-          for SPEC in "AABrowser:$BROWSER_REPO:none:none:-" "AABrowser:$BROWSER_REPO:maps:maps:-" "AAAnything:$HOST_REPO:maps:keep:6" "AAAnything:$HOST_REPO:productivity:keep:7"; do
+          for SPEC in "AABrowser:$BROWSER_REPO:none:none:-" "AABrowser:$BROWSER_REPO:maps:maps:-"; do
             NAME=${SPEC%%:*}; rest=${SPEC#*:}
             REPO=${rest%%:*}; rest=${rest#*:}
             LABEL=${rest%%:*}; rest=${rest#*:}
@@ -271,7 +241,6 @@ jobs:
               python3 work/patchman.py "$D/AndroidManifest.xml" "$MCAT"
               grep -o 'appCategory="[^"]*"' "$D/AndroidManifest.xml" || true
               grep -c CAR_LAUNCHER "$D/AndroidManifest.xml" || true
-              if [ "$SCAT" != "-" ]; then python3 work/patchaa.py "$D" "$SCAT"; fi
               python3 work/bumpver.py "$D/apktool.yml" "$TAG"
               java -jar work/apktool.jar b "$D" -o "work/$NAME-$LABEL-unsigned.apk"
               ls -l "work/$NAME-$LABEL-unsigned.apk"
@@ -279,6 +248,44 @@ jobs:
             ) || echo "APP FAILED: $NAME $LABEL"
           done
           ls -l "$OUT" || true
+      - name: AAAnything minimal dex patch
+        run: |
+          set -eux
+          export OUT="$GITHUB_WORKSPACE/out"; mkdir -p "$OUT" work
+          BT=$(ls -d "${ANDROID_SDK_ROOT:-$ANDROID_HOME}"/build-tools/* | sort -V | tail -1)
+          export PATH="$BT:$PATH"
+          AA_TAG=v1.0.2
+          AA_VER=${AA_TAG#v}
+          curl -sSL -o work/aa-base.apk "https://github.com/kododake/AAAnything/releases/download/$AA_TAG/AAAnything-$AA_VER.apk"
+          cat > work/patchaa_dex.py <<'PY'
+          import hashlib, struct, sys, zipfile, zlib
+          src, dst, cat = sys.argv[1], sys.argv[2], int(sys.argv[3])
+          # AAAnything writes android:appCategory=0 (GAME) into every APK it patches. The
+          # sequence is: const/4 v13,0 ; ByteBuffer.put(B) ; const/16 v7,16 ;
+          # ByteBuffer.put(B) ; ByteBuffer.putInt(v13). Skip the res0 write (the buffer is
+          # zero-filled) and load 6/7 into v13 so only the appCategory data changes.
+          blob = bytes.fromhex('120d6e203c38d000130710006e203c3870006e204138d000')
+          with zipfile.ZipFile(src) as zi:
+              dex = bytearray(zi.read('classes.dex'))
+              if dex.count(blob) != 1:
+                  sys.exit('AAAnything appCategory sequence not found or not unique')
+              off = dex.find(blob)
+              dex[off + 1] = 0x10 * cat + 0x0d
+              dex[off + 2:off + 8] = b'\x00' * 6
+              dex[12:32] = hashlib.sha1(bytes(dex[32:])).digest()
+              dex[8:12] = struct.pack('<I', zlib.adler32(bytes(dex[12:])) & 0xffffffff)
+              with zipfile.ZipFile(dst, 'w') as zo:
+                  for info in zi.infolist():
+                      data = bytes(dex) if info.filename == 'classes.dex' else zi.read(info.filename)
+                      zo.writestr(info, data)
+          print('patched', dst, 'appCategory', cat)
+          PY
+          for CAT in 6 7; do
+            if [ "$CAT" = 6 ]; then LABEL=maps; else LABEL=productivity; fi
+            python3 work/patchaa_dex.py work/aa-base.apk "work/AAAnything-$AA_VER-drive-$LABEL.apk" "$CAT"
+            cp "work/AAAnything-$AA_VER-drive-$LABEL.apk" "$OUT/AAAnything-$AA_VER-drive-$LABEL.apk"
+          done
+          ls -l "$OUT"
       - name: zipalign + sign
         if: ${{ !cancelled() }}
         run: |
