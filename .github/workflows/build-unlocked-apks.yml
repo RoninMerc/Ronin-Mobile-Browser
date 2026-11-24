@@ -314,16 +314,19 @@ jobs:
       # source-built APKs are preferred over the apktool fallback: download them last so they
       # overwrite same-named files.
       - uses: actions/download-artifact@v4
+        continue-on-error: true
         with:
           name: apktool-patch
           path: all
           merge-multiple: true
       - uses: actions/download-artifact@v4
+        continue-on-error: true
         with:
           name: aabrowser-source
           path: all
           merge-multiple: true
       - uses: actions/download-artifact@v4
+        continue-on-error: true
         with:
           name: keystore
           path: all
@@ -370,5 +373,7 @@ jobs:
           variant still shows "parked only", the host is classifying the app by package/allowlist
           rather than by manifest, and no manifest edit can override that.
           EOF
-          gh release create "$TAG" all/*.apk all/rsa.jks all/SHA256SUMS-*.txt \
+          ASSETS="all/*.apk all/SHA256SUMS-*.txt"
+          [ -f all/rsa.jks ] && ASSETS="$ASSETS all/rsa.jks"
+          gh release create "$TAG" $ASSETS \
             --title "Drive-unlocked APKs $TAG" --notes-file notes.md || echo "release create failed (tag may exist)"
