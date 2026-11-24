@@ -220,9 +220,42 @@ jobs:
           open(p, 'w', encoding='utf-8').write(s)
           print(s)
           PY
-          for SPEC in "AABrowser:$BROWSER_REPO:none" "AABrowser:$BROWSER_REPO:maps" "AAAnything:$HOST_REPO:keep" "AAAnything:$HOST_REPO:none"; do
-            NAME=${SPEC%%:*}; rest=${SPEC#*:}; REPO=${rest%%:*}; APP=${rest#*:}
-            D="work/dec-$NAME-$APP"
+          cat > work/patchaa.py <<'PY'
+          import glob, sys
+          d, cat = sys.argv[1], int(sys.argv[2])
+          # apktool cannot relink AppCompat's app:srcCompat (attribute lives in the library package).
+          for x in glob.glob(d + '/res/**/*.xml', recursive=True):
+              s = open(x, encoding='utf-8').read()
+              if 'app:srcCompat' in s:
+                  open(x, 'w', encoding='utf-8').write(s.replace('app:srcCompat', 'android:src'))
+                  print('srcCompat -> android:src:', x)
+          # AAAnything stamps android:appCategory=0 (GAME) into every APK it patches, which is
+          # exactly what makes Android Auto treat those apps as parked. Rewrite the constant to
+          # a non-parked category (6=maps, 7=productivity).
+          hit = 0
+          for f in glob.glob(d + '/smali*/**/*.smali', recursive=True):
+              lines = open(f, encoding='utf-8').read().split('\n')
+              if not any('"appCategory"' in l for l in lines):
+                  continue
+              for i, l in enumerate(lines):
+                  if 'putInt(I)Ljava/nio/ByteBuffer;' in l and '{v0, v13}' in l:
+                      if 'const/16 v7, 0x10' in '\n'.join(lines[max(0, i-25):i]):
+                          lines[i:i+1] = ['    const/4 v13, 0x%x' % cat, l, '    const/4 v13, 0x0']
+                          hit += 1
+                          break
+              if hit:
+                  open(f, 'w', encoding='utf-8').write('\n'.join(lines))
+                  print('patched appCategory in', f, '->', cat)
+                  break
+          if not hit:
+              sys.exit('appCategory constant not found - AAAnything patcher changed')
+          PY
+          for SPEC in "AABrowser:$BROWSER_REPO:none:none:-" "AABrowser:$BROWSER_REPO:maps:maps:-" "AAAnything:$HOST_REPO:maps:keep:6" "AAAnything:$HOST_REPO:productivity:keep:7"; do
+            NAME=${SPEC%%:*}; rest=${SPEC#*:}
+            REPO=${rest%%:*}; rest=${rest#*:}
+            LABEL=${rest%%:*}; rest=${rest#*:}
+            MCAT=${rest%%:*}; SCAT=${rest#*:}
+            D="work/dec-$NAME-$LABEL"
             (
               set -e
               rm -rf "$D"
@@ -234,15 +267,16 @@ jobs:
               curl -sSL -o work/base.apk "$ASSET"
               ls -l work/base.apk
               java -jar work/apktool.jar d -f work/base.apk -o "$D"
-              echo "=== $NAME manifest ($APP) ==="; cat "$D/AndroidManifest.xml"
-              python3 work/patchman.py "$D/AndroidManifest.xml" "$APP"
+              echo "=== $NAME manifest ($LABEL) ==="; cat "$D/AndroidManifest.xml"
+              python3 work/patchman.py "$D/AndroidManifest.xml" "$MCAT"
               grep -o 'appCategory="[^"]*"' "$D/AndroidManifest.xml" || true
               grep -c CAR_LAUNCHER "$D/AndroidManifest.xml" || true
+              if [ "$SCAT" != "-" ]; then python3 work/patchaa.py "$D" "$SCAT"; fi
               python3 work/bumpver.py "$D/apktool.yml" "$TAG"
-              java -jar work/apktool.jar b "$D" -o "work/$NAME-$APP-unsigned.apk"
-              ls -l "work/$NAME-$APP-unsigned.apk"
-              cp "work/$NAME-$APP-unsigned.apk" "$OUT/$NAME-$TAG-drive-$APP.apk"
-            ) || echo "APP FAILED: $NAME $APP"
+              java -jar work/apktool.jar b "$D" -o "work/$NAME-$LABEL-unsigned.apk"
+              ls -l "work/$NAME-$LABEL-unsigned.apk"
+              cp "work/$NAME-$LABEL-unsigned.apk" "$OUT/$NAME-$TAG-drive-$LABEL.apk"
+            ) || echo "APP FAILED: $NAME $LABEL"
           done
           ls -l "$OUT" || true
       - name: zipalign + sign
@@ -276,6 +310,7 @@ jobs:
     runs-on: ubuntu-latest
     if: ${{ !cancelled() }}
     steps:
+      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
           path: all
@@ -306,5 +341,5 @@ jobs:
           developer settings, Unknown sources, Customize launcher. Uninstall the upstream build first
           (different signing key).
           EOF
-          gh release create "$TAG" all/*.apk all/SHA256SUMS-*.txt \
+          gh release create "$TAG" all/*.apk all/rsa.jks all/SHA256SUMS-*.txt \
             --title "Drive-unlocked APKs $TAG" --notes-file notes.md || echo "release create failed (tag may exist)"
