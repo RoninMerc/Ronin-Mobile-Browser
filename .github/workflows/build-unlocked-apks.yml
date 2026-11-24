@@ -331,15 +331,31 @@ jobs:
 
           Why they were blocked: Android Auto treats android:appCategory="game" (and "video") as a
           "parked app" and blocks it while the car moves. AABrowser shipped appCategory="game".
+          AAAnything stamps appCategory=0 (GAME) into every APK it patches, so apps patched with the
+          stock AAAnything were parked too.
 
-          What changed (manifest + version only, no app logic touched):
-          - appCategory removed (-none) or changed to a non-parked value (-maps / -productivity).
-          - distractionOptimized forced to true, CAR_LAUNCHER ensured.
-          - versionCode/versionName bumped; unsigned output re-signed with the keystore in this release.
+          AABrowser (the browser):
+          - AABrowser-3.5-drive-none.apk        appCategory removed
+          - AABrowser-3.5-drive-maps.apk        appCategory=6 (maps)
+          - AABrowser-3.5-drive-productivity.apk appCategory=7 (productivity)
+          All keep distractionOptimized=true and CAR_LAUNCHER; versionCode 1002, versionName 3.5-drive.
 
-          Try -none first, then -maps. Install via Shizuku-Next + KingInstaller, then Android Auto
-          developer settings, Unknown sources, Customize launcher. Uninstall the upstream build first
-          (different signing key).
+          AAAnything (the patcher):
+          - AAAnything-1.0.2-drive-maps.apk         patched apps get appCategory=6 (maps)
+          - AAAnything-1.0.2-drive-productivity.apk patched apps get appCategory=7 (productivity)
+          Only the appCategory constant AAAnything writes into patched APKs is changed.
+
+          Install (Shizuku + KingInstaller):
+          1. Uninstall the upstream build first (different signing key).
+          2. Start Shizuku (wireless debugging or root) and grant KingInstaller Shizuku permission.
+          3. Install the APK with KingInstaller.
+          4. Android Auto developer settings -> Unknown sources, then Customize launcher.
+          5. Try AABrowser -none first, then -maps, then -productivity. For other apps, patch with
+             AAAnything -maps / -productivity and reinstall the patched APK.
+
+          Caveat: the driving restriction is enforced by the phone-side Android Auto host. If a
+          variant still shows "parked only", the host is classifying the app by package/allowlist
+          rather than by manifest, and no manifest edit can override that.
           EOF
           gh release create "$TAG" all/*.apk all/rsa.jks all/SHA256SUMS-*.txt \
             --title "Drive-unlocked APKs $TAG" --notes-file notes.md || echo "release create failed (tag may exist)"
