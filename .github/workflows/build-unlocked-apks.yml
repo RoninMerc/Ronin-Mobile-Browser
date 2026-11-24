@@ -11,6 +11,11 @@ name: build-unlocked-apks
 on:
   push:
     branches: [main, master]
+    # Do not burn a full run for doc/keystore-only pushes (the keystore job
+    # commits .keystore/rsa.jks back to main; that push must not re-fire us).
+    paths-ignore:
+      - 'docs/**'
+      - '.keystore/**'
   workflow_dispatch:
 
 permissions:
@@ -51,7 +56,7 @@ jobs:
           set -x
           git config user.email "actions@github.com"
           git config user.name "github-actions"
-          git add .keystore/rsa.jks
+          git add -f .keystore/rsa.jks   # -f: repo .gitignore has *.jks
           git diff --cached --quiet || { git commit -m "build: stable signing keystore"; git push; }
       - uses: actions/upload-artifact@v4
         with:
@@ -73,7 +78,9 @@ jobs:
         with:
           distribution: temurin
           java-version: '21'
-      - uses: android-actions/setup-android@v3
+      # v3 is broken since Google removed the legacy 'tools' SDK package
+      # (sdkmanager exits 1 with "Failed to find package 'tools'").
+      - uses: android-actions/setup-android@v4
       - uses: actions/download-artifact@v4
         with:
           name: keystore
@@ -144,7 +151,11 @@ jobs:
             mv "$f.aligned" "$f"
             "$BT/apksigner" verify --print-certs "$f" | tail -3 || true
           done
-          sha256sum out/*.apk | tee out/SHA256SUMS-source.txt
+          if ls out/*.apk >/dev/null 2>&1; then
+            sha256sum out/*.apk | tee out/SHA256SUMS-source.txt
+          else
+            echo "no source APKs produced - skipping sums"
+          fi
       - uses: actions/upload-artifact@v4
         if: ${{ !cancelled() }}
         with:
@@ -161,7 +172,7 @@ jobs:
         with:
           distribution: temurin
           java-version: '21'
-      - uses: android-actions/setup-android@v3
+      - uses: android-actions/setup-android@v4
       - uses: actions/download-artifact@v4
         with:
           name: keystore
@@ -224,6 +235,80 @@ jobs:
               ls -l work/base.apk
               java -jar work/apktool.jar d -f work/base.apk -o "$D"
               echo "=== $NAME manifest ($APP) ==="; cat "$D/AndroidManifest.xml"
+              python3 work/patchman.py "$D/AndroidManifest.xml" "$APP"
+              grep -o 'appCategory="[^"]*"' "$D/AndroidManifest.xml" || true
+              grep -c CAR_LAUNCHER "$D/AndroidManifest.xml" || true
+              python3 work/bumpver.py "$D/apktool.yml" "$TAG"
+              java -jar work/apktool.jar b "$D" -o "work/$NAME-$APP-unsigned.apk"
+              ls -l "work/$NAME-$APP-unsigned.apk"
+              cp "work/$NAME-$APP-unsigned.apk" "$OUT/$NAME-$TAG-drive-$APP.apk"
+            ) || echo "APP FAILED: $NAME $APP"
+          done
+          ls -l "$OUT" || true
+      - name: zipalign + sign
+        if: ${{ !cancelled() }}
+        run: |
+          set -eux
+          BT=$(ls -d "${ANDROID_SDK_ROOT:-$ANDROID_HOME}"/build-tools/* | sort -V | tail -1)
+          KS="$GITHUB_WORKSPACE/keys/rsa.jks"
+          for f in out/*.apk; do
+            [ -f "$f" ] || continue
+            zip -d "$f" 'META-INF/*.RSA' 'META-INF/*.SF' 'META-INF/*.MF' || true
+            "$BT/zipalign" -p -f 4 "$f" "$f.aligned"
+            "$BT/apksigner" sign --ks "$KS" --ks-pass pass:android --key-pass pass:android --ks-key-alias unlocked "$f.aligned"
+            mv "$f.aligned" "$f"
+            "$BT/apksigner" verify --print-certs "$f" | tail -3 || true
+          done
+          if ls out/*.apk >/dev/null 2>&1; then
+            sha256sum out/*.apk | tee out/SHA256SUMS-apktool.txt
+          else
+            echo "no apktool APKs produced - skipping sums"
+          fi
+      - uses: actions/upload-artifact@v4
+        if: ${{ !cancelled() }}
+        with:
+          name: apktool-patch
+          path: out/
+
+  release:
+    name: publish release
+    needs: [aabrowser-source, apktool-patch]
+    runs-on: ubuntu-latest
+    if: ${{ !cancelled() }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: all
+          merge-multiple: true
+      - name: gh release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -ux
+          ls -lR all || true
+          if ! ls all/*.apk >/dev/null 2>&1; then
+            echo "no APKs built - skipping release"
+            exit 0
+          fi
+          TAG="unlocked-${{ github.run_number }}"
+          cat > notes.md <<'EOF'
+          Drive-unlocked rebuilds of the Android Auto head-unit apps.
+
+          Why they were blocked: Android Auto treats android:appCategory="game" (and "video") as a
+          "parked app" and blocks it while the car moves. AABrowser shipped appCategory="game".
+
+          What changed (manifest + version only, no app logic touched):
+          - appCategory removed (-none) or changed to a non-parked value (-maps / -productivity).
+          - distractionOptimized forced to true, CAR_LAUNCHER ensured.
+          - versionCode/versionName bumped; unsigned output re-signed with the keystore in this release.
+
+          Try -none first, then -maps. Install via Shizuku-Next + KingInstaller, then Android Auto
+          developer settings, Unknown sources, Customize launcher. Uninstall the upstream build first
+          (different signing key).
+          EOF
+          gh release create "$TAG" all/*.apk all/rsa.jks all/SHA256SUMS-*.txt \
+            --title "Drive-unlocked APKs $TAG" --notes-file notes.md || echo "release create failed (tag may exist)"
+oidManifest.xml"
               python3 work/patchman.py "$D/AndroidManifest.xml" "$APP"
               grep -o 'appCategory="[^"]*"' "$D/AndroidManifest.xml" || true
               grep -c CAR_LAUNCHER "$D/AndroidManifest.xml" || true
