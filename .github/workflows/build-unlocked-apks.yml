@@ -311,8 +311,21 @@ jobs:
     if: ${{ !cancelled() }}
     steps:
       - uses: actions/checkout@v4
+      # source-built APKs are preferred over the apktool fallback: download them last so they
+      # overwrite same-named files.
       - uses: actions/download-artifact@v4
         with:
+          name: apktool-patch
+          path: all
+          merge-multiple: true
+      - uses: actions/download-artifact@v4
+        with:
+          name: aabrowser-source
+          path: all
+          merge-multiple: true
+      - uses: actions/download-artifact@v4
+        with:
+          name: keystore
           path: all
           merge-multiple: true
       - name: gh release
